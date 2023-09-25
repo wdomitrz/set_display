@@ -1,0 +1,382 @@
+#!/usr/bin/env python3
+
+################################################################
+# Copyright (c) 2022 Witalis Domitrz <witekdomitrz@gmail.com>
+# AGPL License
+################################################################
+
+import argparse
+import enum
+import glob
+import math
+import os
+import re
+import subprocess
+import tempfile
+from typing import Dict, List, Optional, Tuple
+
+
+class LookingFor(enum.Enum):
+    RESOLUTION = enum.auto()
+    WIDTH = enum.auto()
+    HEIGHT = enum.auto()
+    DONE = enum.auto()
+
+
+PRIMARY_ORDER_DEFAULT = ["screen", "rdp", "DP", "HDMI", "eDP"]
+
+
+class DefaultScreenExternal:  # pylint: disable=too-few-public-methods
+    DIAMETER_INCH = 24
+    WIDTH_MM = 531
+    RESOLUTION_X = 1920
+    DPI = 96
+
+
+class DefaultScreenLaptop:  # pylint: disable=too-few-public-methods
+    DIAMETER_INCH = 14
+    WIDTH_MM = 310
+    RESOLUTION_X = 1920
+    DPI = 114
+
+
+def get_displays_info():
+    res = subprocess.run(
+        "xrandr", text=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    return list(map(lambda x: x.split(), res.stdout.splitlines()))
+
+
+def is_laptop_display(display):
+    return "eDP" == display[:3]
+
+
+def is_laptop_display_open():
+    state_files = glob.glob("/proc/acpi/button/lid/LID*/state")
+    if len(state_files) == 0:
+        raise RuntimeError("No laptop screen")
+
+    for fn in state_files:
+        with open(fn, encoding="utf-8") as f:
+            if f.read().split()[1] == "open":
+                return True
+    return False
+
+
+def get_all_displays_names(check_some_connected_displays=True) -> Tuple[List, List]:
+    connected, disconnected = [], []
+    for line in get_displays_info():
+        if len(line) >= 2:
+            display = line[0]
+            state = line[1]
+
+            if "connected" == state:
+                if is_laptop_display(display):
+                    if is_laptop_display_open():
+                        connected.append(display)
+                    else:
+                        disconnected.append(display)
+                else:
+                    connected.append(display)
+            elif "disconnected" == state:
+                disconnected.append(display)
+
+    if check_some_connected_displays and not connected:
+        raise RuntimeError("No connected displays found")
+
+    return connected, disconnected
+
+
+def get_primary_display(displays, primary_order=None):
+    if primary_order is None:
+        primary_order = PRIMARY_ORDER_DEFAULT
+
+    for requirement in primary_order:
+        for display in displays:
+            if display.startswith(requirement):
+                return display
+    return displays[0]
+
+
+def set_display_primary(display):
+    set_display_auto(display, primary=True)
+    set_dpi_func(get_dpi_based_on(display=display))
+
+
+def set_display_auto(  # pylint: disable=too-many-arguments
+    display,
+    primary=False,
+    same_as=None,
+    left_of=None,
+    right_of=None,
+    above=None,
+    below=None,
+    **_,
+):
+    cmd = ["xrandr", "--output", display, "--auto"]
+
+    if primary:
+        cmd += ["--primary"]
+
+    if same_as is not None:
+        cmd += ["--same-as", same_as]
+    elif left_of is not None:
+        cmd += ["--left-of", left_of]
+    elif right_of is not None:
+        cmd += ["--right-of", left_of]
+    elif above is not None:
+        cmd += ["--above", above]
+    elif below is not None:
+        cmd += ["--below", below]
+
+    if display.startswith("DP"):
+        cmd += ["--set", "Broadcast RGB", "Full"]
+
+    subprocess.run(cmd, check=False)
+
+
+def set_display_off(display, **_):
+    subprocess.run(["xrandr", "--output", display, "--off"], check=False)
+
+
+def set_display_other(display, **kwargs):
+    if os.getenv("SINGLE_DISPLAY") == "1":
+        other_display_action = set_display_off
+    else:
+        other_display_action = set_display_auto
+
+    other_display_action(display, **kwargs)
+
+
+def get_display_info(display):
+    """
+    assumes that the selected display is turned on
+    """
+    displays_info = get_displays_info()
+
+    this_display_info = None
+    for line in displays_info:
+        if display == line[0]:
+            this_display_info = line
+            break
+
+    RESOLUTION_REGEX = re.compile("(\\d+)i?x(\\d+)i?(\\+(\\d+)\\+(\\d+))?")
+    DIMENSION_REGEX = re.compile("(\\d+)mm")
+
+    if this_display_info is None:
+        raise KeyError(display, "display info not found")
+
+    result = {"name": display}
+    result["connected"] = this_display_info[1] == "connected"
+    result["primary"] = this_display_info[2] == "primary"
+
+    result["is_laptop"] = is_laptop_display(display)
+
+    looking_for = LookingFor.RESOLUTION
+    for data in this_display_info:
+        if looking_for == LookingFor.RESOLUTION:
+            res = RESOLUTION_REGEX.fullmatch(data)
+            if res is None:
+                continue
+
+            result["resolution"] = {"x": int(res.group(1)), "y": int(res.group(2))}
+            if len(res.groups()) >= 5:
+                result["position"] = {"x": int(res.group(4)), "y": int(res.group(5))}
+
+            looking_for = LookingFor.WIDTH
+        elif looking_for == LookingFor.WIDTH:
+            res = DIMENSION_REGEX.fullmatch(data)
+            if res is None:
+                continue
+
+            result["size"] = {"width": int(res.group(1))}
+
+            looking_for = LookingFor.HEIGHT
+        elif looking_for == LookingFor.HEIGHT:
+            res = DIMENSION_REGEX.fullmatch(data)
+            if res is None:
+                continue
+
+            result["size"].update({"height": int(res.group(1))})
+
+            looking_for = LookingFor.DONE
+        else:
+            break
+
+    return result
+
+
+def set_rofi_dpi_legacy(dpi):
+    with tempfile.NamedTemporaryFile("w+") as config_file:
+        config_file.write(
+            f"""\
+rofi.dpi: {dpi}
+"""
+        )
+        config_file.seek(0)
+        subprocess.run(["xrdb", "-override", config_file.name], check=True)
+
+
+def set_rofi_dpi(dpi):
+    CONFIG_DIR = os.path.expanduser("~/.config/rofi")
+    if not os.path.isdir(CONFIG_DIR):
+        return
+
+    # Check if config imports dpi.rasi
+    add_dpi_import = False
+    try:
+        with open(
+            os.path.join(CONFIG_DIR, "config.rasi"), "r", encoding="utf-8"
+        ) as rofi_config_file:
+            for line in rofi_config_file.readlines():
+                if line == '@import "dpi"\n':
+                    break
+            else:
+                add_dpi_import = True
+    except FileNotFoundError:
+        add_dpi_import = True
+    if add_dpi_import:
+        with open(
+            os.path.join(CONFIG_DIR, "config.rasi"), "r+", encoding="utf-8"
+        ) as rofi_config_file:
+            rofi_config_contents = rofi_config_file.read()
+            rofi_config_file.seek(0)
+            rofi_config_file.write(
+                f"""\
+@import "dpi"
+{rofi_config_contents}
+"""
+            )
+
+    with open(
+        os.path.join(CONFIG_DIR, "dpi.rasi"), "w+", encoding="utf-8"
+    ) as rofi_dpi_config_file:
+        rofi_dpi_config_file.write(
+            f"""\
+configuration {{
+    dpi: {dpi};
+}}
+"""
+        )
+
+
+def set_dpi_func(dpi):
+    with tempfile.NamedTemporaryFile("w+") as config_file:
+        config_file.write(
+            f"""\
+Xft.dpi: {dpi}
+"""
+        )
+        config_file.seek(0)
+        subprocess.run(["xrdb", "-override", config_file.name], check=False)
+    set_rofi_dpi(dpi)
+
+
+def get_dpi_based_on(display, check_connected=True, check_primary=True) -> int:
+    dpi = get_forced_dpi()
+
+    if dpi is not None:
+        return dpi
+
+    display_info = get_display_info(display)
+
+    if check_connected and not display_info["connected"]:
+        raise RuntimeError(display, "not connected", display_info)
+    if check_primary and not display_info["primary"]:
+        raise RuntimeError(display, "not primary", display_info)
+
+    display_info["dpi"] = get_my_dpi(**display_info)
+    return display_info["dpi"]
+
+
+def get_my_dpi(resolution: Dict[str, int], size, is_laptop=False, **_):
+    if is_laptop:
+        DefaultScreen = DefaultScreenLaptop
+    else:
+        DefaultScreen = DefaultScreenExternal
+
+    if (
+        size["height"] == 0
+        or size["width"] == 0
+        or (
+            resolution["x"] * size["height"] == resolution["y"] * size["width"]
+            and math.gcd(size["height"], size["width"]) == 1
+        )
+    ):
+        return DefaultScreen.DPI  # If cannot get the dpi, return the default
+
+    dpi = round(
+        DefaultScreen.DPI
+        * max(resolution["x"], resolution["y"])
+        * DefaultScreen.WIDTH_MM
+        / (size["width"] * DefaultScreen.RESOLUTION_X)
+    )
+
+    return dpi
+
+
+def get_forced_dpi():
+    # Check the environmental variable
+    env_dpi = os.getenv("DPI")
+    if env_dpi is not None and env_dpi != "":
+        return int(env_dpi)
+
+    return None
+
+
+def get_default_dpi(**kwargs):
+    connected_displays, _ = get_all_displays_names()
+    display = get_primary_display(connected_displays)
+    return get_dpi_based_on(display, **kwargs)
+
+
+def set_display():
+    connected_displays, disconnected_display = get_all_displays_names()
+    primary_display = get_primary_display(connected_displays)
+
+    # Turn primary display on
+    set_display_primary(primary_display)
+
+    # Turn off all disconnected display
+    for display in disconnected_display:
+        set_display_off(display)
+
+    # Deal with other connected displays
+    for display in connected_displays:
+        if display != primary_display:
+            set_display_other(display)
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser()
+    parser.set_defaults(func=set_display)
+    subparsers = parser.add_subparsers(title="subcommands")
+
+    show_dpi_parser = subparsers.add_parser(
+        "show_dpi", description="Display inferred dpi."
+    )
+    show_dpi_parser.set_defaults(func=lambda **kwargs: print(get_default_dpi(**kwargs)))
+
+    set_dpi_parser = subparsers.add_parser("set_dpi")
+    set_dpi_parser.set_defaults(
+        func=lambda dpi, **kwargs: set_dpi_func(
+            dpi=get_default_dpi(**kwargs) if dpi is None else dpi
+        )
+    )
+    set_dpi_parser.add_argument(
+        "--dpi",
+        type=int,
+        required=False,
+        help="Set dpi to use, if not set use the inferred dpi.",
+    )
+
+    args = parser.parse_args()
+    return args
+
+
+def main(*, func, **kwargs):
+    func(**kwargs)
+
+
+if __name__ == "__main__":
+    main(**vars(parse_arguments()))
